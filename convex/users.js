@@ -1,93 +1,94 @@
-import { query, mutation } from "./_generated/server";
-import { v } from "convex/values";
+// convex/users.js
+import { internalQuery, internalMutation, query } from "./_generated/server";
 
-// Store user after Clerk login
-export const store = mutation({
-  args: {},
+/* ----------------------------------------------------------
+   INTERNAL: Fetch current Clerk-authenticated user
+----------------------------------------------------------- */
+export const getCurrentUser = internalQuery({
   handler: async (ctx) => {
     const identity = await ctx.auth.getUserIdentity();
-    if (!identity) throw new Error("Not authenticated");
 
+    if (!identity) return null; // Not logged in
+
+    const clerkId = identity.subject;
+
+    // Look up user by clerkId
+    const user = await ctx.db
+      .query("users")
+      .withIndex("by_clerkId", (q) => q.eq("clerkId", clerkId))
+      .unique();
+
+    return user ?? null;
+  },
+});
+
+/* ----------------------------------------------------------
+   PUBLIC: Return current user safely (never throws)
+----------------------------------------------------------- */
+export const currentUser = query({
+  handler: async (ctx) => {
+    try {
+      const user = await ctx.runQuery(internal.users.getCurrentUser);
+      return user ?? null;
+    } catch {
+      return null;
+    }
+  },
+});
+
+/* ----------------------------------------------------------
+   INTERNAL: Create user if first login
+----------------------------------------------------------- */
+export const createUserIfMissing = internalMutation({
+  handler: async (ctx) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) return null; // unauthenticated user
+
+    const clerkId = identity.subject;
+    const email = identity.email ?? "";
+    const name = identity.name ?? identity.firstName ?? "User";
+    const imageUrl = identity.pictureUrl ?? null;
+
+    // Check if user exists
     const existing = await ctx.db
       .query("users")
-      .withIndex("by_token", (q) =>
-        q.eq("tokenIdentifier", identity.tokenIdentifier)
-      )
+      .withIndex("by_clerkId", (q) => q.eq("clerkId", clerkId))
       .unique();
 
-    if (existing) return existing._id;
-
-    return await ctx.db.insert("users", {
-      name: identity.name ?? "User",
-      email: identity.email,
-      tokenIdentifier: identity.tokenIdentifier,
-      imageUrl: identity.pictureUrl,
-    });
-  },
-});
-
-// Get logged-in user
-export const getCurrentUser = query({
-  handler: async (ctx) => {
-    const identity = await ctx.auth.getUserIdentity();
-    if (!identity) throw new Error("Not authenticated");
-
-    return await ctx.db
-      .query("users")
-      .withIndex("by_token", (q) =>
-        q.eq("tokenIdentifier", identity.tokenIdentifier)
-      )
-      .unique();
-  },
-});
-
-// Search users (supports virtual emails)
-export const searchUsers = query({
-  args: { query: v.string() },
-  handler: async (ctx, { query: q }) => {
-    const trimmed = q.trim();
-    if (trimmed.length < 2) return [];
-
-    // Email pattern
-    if (trimmed.includes("@")) {
-      const existing = await ctx.db
-        .query("users")
-        .withIndex("by_email", (qq) => qq.eq("email", trimmed))
-        .unique();
-
-      if (existing) {
-        return [
-          {
-            id: existing._id,
-            name: existing.name,
-            email: existing.email,
-            imageUrl: existing.imageUrl,
-          },
-        ];
-      }
-
-      // Virtual user
-      return [
-        {
-          id: null,
-          name: trimmed.split("@")[0],
-          email: trimmed,
-          imageUrl: null,
-        },
-      ];
+    if (existing) {
+      // Optional: keep profile updated
+      await ctx.db.patch(existing._id, {
+        name,
+        email,
+        imageUrl,
+      });
+      return existing._id;
     }
 
-    // Name search
-    const results = await ctx.db
-      .query("users")
-      .withSearchIndex("search_name", (qq) => qq.search("name", trimmed))
-      .collect();
+    // Create new Convex user
+    const userId = await ctx.db.insert("users", {
+      clerkId,
+      name,
+      email,
+      imageUrl,
+    });
 
-    return results.map((u) => ({
-      id: u._id,
-      name: u.name,
-      email: u.email,
-      imageUrl: u.imageUrl,
-    }));
+    return userId;
+  },
+});
+
+/* ----------------------------------------------------------
+   PUBLIC: Ensure user exists (called on auth)
+----------------------------------------------------------- */
+export const ensureUser = query({
+  handler: async (ctx) => {
+    try {
+      const userId = await ctx.runMutation(
+        internal.users.createUserIfMissing
+      );
+      return userId ?? null;
+    } catch {
+      return null;
+    }
   },
 });
